@@ -37,12 +37,14 @@ serde, instrumentation, configuration, and DI integration — is to be built.
 - **D1 — Native-first.** Optimize for the idioms, semantics, and mechanics of the .NET platform.
   The siblings inform *what* to build, not *how*.
 - **D2 — `Core` embraces the standard abstraction packages.** `Core` may depend on
-  `Microsoft.Extensions.Logging.Abstractions`, `Microsoft.Extensions.Options`, and
-  `System.Diagnostics.DiagnosticSource`. These are the near-universal, Microsoft-owned packages that
-  *are* how a .NET library plugs into the ecosystem. `Core` still ships no transport, no concrete
-  serializer, and no heavy runtime dependencies. The bespoke `ClientLogger` / `InstrumentationContext`
-  / `Tracer` / `Meter` / `Configuration` types from the siblings are **not ported** — `Core` uses
-  `ILogger`, `Activity`/`ActivitySource`/`Meter`, and `IOptions<>` directly.
+  `Microsoft.Extensions.Logging.Abstractions` and `System.Diagnostics.DiagnosticSource` — the
+  near-universal, Microsoft-owned packages that *are* how a .NET library plugs into the ecosystem.
+  `Core` still ships no transport, no concrete serializer, and no heavy runtime dependencies. The
+  bespoke `ClientLogger` / `InstrumentationContext` / `Tracer` / `Meter` / `Configuration` types from
+  the siblings are **not ported** — `Core` uses `ILogger` and `Activity`/`ActivitySource`/`Meter`
+  directly. Configuration is plain option POCOs in `Core`; the `Microsoft.Extensions.Options`
+  machinery (`IOptions<T>`, binding, validation) lives in the DI integration package, not `Core`
+  (see the Options slice).
 - **D3 — Transport-agnostic pipeline with native interop.** `IAsyncHttpClient` remains the bottom
   seam. The pipeline is a thin, native, transport-agnostic chain above it and owns *SDK-domain*
   concerns: auth, idempotency keys, typed-error- and `Retry-After`-aware retry, redirect semantics,
@@ -70,9 +72,8 @@ serde, instrumentation, configuration, and DI integration — is to be built.
 One cohesive `Core` toolkit plus separated implementations, integrations, and transports:
 
 ```
-Microsoft.Extensions.Logging.Abstractions ┐
-Microsoft.Extensions.Options              ├─ abstractions only, no heavy deps
-System.Diagnostics.DiagnosticSource       ┘
+Microsoft.Extensions.Logging.Abstractions ┐ abstractions only, no heavy deps
+System.Diagnostics.DiagnosticSource       ┘ (Options machinery lives in the DI package)
                   ▲
         ┌─────────┴──────────┐
         │  Dexpace.Sdk.Core  │  net8.0; net10.0 — the whole toolkit:
