@@ -72,4 +72,91 @@ public class UrlRedactorTests
         Assert.Contains("x-custom-secret=REDACTED", result);
         Assert.Contains("other=value", result);
     }
+
+    // ── Edge-case tests added by code-review hardening ────────────────────────
+
+    [Fact]
+    public void Redact_RelativeUri_SensitiveQueryParamIsRedacted_NoException()
+    {
+        // A relative URI carrying a sensitive query param must not throw and must not leak.
+        var uri = new Uri("/v1/items?token=super-secret&page=2", UriKind.Relative);
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.Contains("token=REDACTED", result);
+        Assert.DoesNotContain("super-secret", result);
+        Assert.Contains("page=2", result);
+        Assert.Contains("/v1/items", result);
+    }
+
+    [Fact]
+    public void Redact_Fragment_IsDropped()
+    {
+        // Fragments should be stripped from absolute URIs.
+        var uri = new Uri("https://api.example.com/path?q=hello#section");
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.DoesNotContain("#section", result);
+        Assert.Contains("q=hello", result);
+    }
+
+    [Fact]
+    public void Redact_RelativeUri_Fragment_IsDropped()
+    {
+        // Fragments should be stripped from relative URIs too.
+        var uri = new Uri("/path?q=hello#section", UriKind.Relative);
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.DoesNotContain("#section", result);
+        Assert.Contains("q=hello", result);
+    }
+
+    [Fact]
+    public void Redact_ValuelessParam_DoesNotCrash_AndSensitiveParamIsStillRedacted()
+    {
+        // "?flag" has no '=' so it is skipped (no value to leak); token must still be redacted.
+        var uri = new Uri("https://api.example.com/v1?flag&token=x");
+        var result = DefaultRedactor.Redact(uri);
+
+        // The bare flag is dropped (no value — safe to omit).
+        Assert.DoesNotContain("flag=", result);
+        // The sensitive token value must not appear.
+        Assert.Contains("token=REDACTED", result);
+        Assert.DoesNotContain("=x", result);
+    }
+
+    [Fact]
+    public void Redact_RepeatedSensitiveParam_BothValuesAreRedacted()
+    {
+        // Both occurrences of a repeated sensitive param must be redacted.
+        var uri = new Uri("https://api.example.com/v1?token=A&token=B");
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.DoesNotContain("=A", result);
+        Assert.DoesNotContain("=B", result);
+        // Both occurrences of the key should appear, both redacted.
+        Assert.Equal(2, result.Split("token=REDACTED").Length - 1);
+    }
+
+    [Fact]
+    public void Redact_PercentEncodedSensitiveValue_IsRedacted()
+    {
+        // A percent-encoded sensitive value must still be caught and redacted.
+        var uri = new Uri("https://api.example.com/v1?token=my%2Fsecret%3Dvalue");
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.Contains("token=REDACTED", result);
+        Assert.DoesNotContain("secret", result);
+    }
+
+    [Fact]
+    public void Redact_PathSegmentThatLooksSecret_IsPreservedVerbatim()
+    {
+        // Path components are NOT inspected — secrets in the path are the caller's responsibility.
+        // This test documents the boundary: path is preserved, no redaction is applied there.
+        var uri = new Uri("https://api.example.com/token/super-secret-value?page=1");
+        var result = DefaultRedactor.Redact(uri);
+
+        Assert.Contains("/token/super-secret-value", result);
+        Assert.Contains("page=1", result);
+    }
 }

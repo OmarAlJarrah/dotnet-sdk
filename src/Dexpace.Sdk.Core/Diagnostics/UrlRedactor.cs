@@ -10,9 +10,31 @@ namespace Dexpace.Sdk.Core.Diagnostics;
 /// replacing the values of known-sensitive query parameters with <c>REDACTED</c>.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Sensitive parameter names are matched case-insensitively. The default set covers the most
 /// common credential-bearing parameters; callers may supply a custom set instead.
-/// Non-sensitive parameters and all path/host/scheme components are preserved verbatim.
+/// </para>
+/// <para>
+/// <strong>Redaction boundary:</strong>
+/// <list type="bullet">
+///   <item><description>
+///     <strong>Userinfo</strong> (the <c>user:password@</c> segment of an authority) is always
+///     removed.
+///   </description></item>
+///   <item><description>
+///     <strong>Sensitive query-parameter values</strong> are replaced with <c>REDACTED</c>;
+///     names and non-sensitive parameters are preserved verbatim.
+///   </description></item>
+///   <item><description>
+///     <strong>Fragment</strong> (the <c>#…</c> portion) is always dropped — fragments are
+///     client-side only and carry no information relevant to logging.
+///   </description></item>
+///   <item><description>
+///     <strong>Path segments are preserved verbatim.</strong> Callers must not embed secrets
+///     inside the URL path; this class does not inspect or redact path components.
+///   </description></item>
+/// </list>
+/// </para>
 /// </remarks>
 public sealed class UrlRedactor
 {
@@ -56,14 +78,27 @@ public sealed class UrlRedactor
 
     /// <summary>
     /// Returns a log-safe representation of <paramref name="uri"/>: userinfo is always stripped;
-    /// sensitive query parameter values are replaced with <c>REDACTED</c>.
+    /// sensitive query parameter values are replaced with <c>REDACTED</c>; the fragment is
+    /// dropped. For non-absolute URIs the method operates on <see cref="Uri.OriginalString"/>
+    /// and never throws.
     /// </summary>
-    /// <param name="uri">The URI to redact.</param>
+    /// <param name="uri">The URI to redact. May be relative or absolute.</param>
     /// <returns>A safe string representation.</returns>
     public string Redact(Uri uri)
     {
         ArgumentNullException.ThrowIfNull(uri);
 
+        if (uri.IsAbsoluteUri)
+        {
+            return RedactAbsolute(uri);
+        }
+
+        return RedactRelative(uri.OriginalString);
+    }
+
+    // Handles fully-qualified URIs where Uri properties are safe to access.
+    private string RedactAbsolute(Uri uri)
+    {
         var query = uri.Query;
 
         // Build the base URL without userinfo and without the query string.
@@ -72,6 +107,7 @@ public sealed class UrlRedactor
             UserName = string.Empty,
             Password = string.Empty,
             Query = string.Empty,
+            Fragment = string.Empty,
         };
         var baseUrl = builder.Uri.GetLeftPart(UriPartial.Path);
 
@@ -80,7 +116,40 @@ public sealed class UrlRedactor
             return baseUrl;
         }
 
-        // Parse, redact, and re-serialize the query string without System.Web dependency.
+        var redactedQuery = RedactQuery(query);
+        return redactedQuery.Length == 0 ? baseUrl : $"{baseUrl}?{redactedQuery}";
+    }
+
+    // Handles relative URI references by operating on the raw string directly.
+    // Relative references have no userinfo, so only fragment dropping and query redaction apply.
+    private string RedactRelative(string originalString)
+    {
+        // Drop the fragment first (everything from the first '#').
+        var fragmentIndex = originalString.IndexOf('#', StringComparison.Ordinal);
+        var withoutFragment = fragmentIndex >= 0
+            ? originalString[..fragmentIndex]
+            : originalString;
+
+        // Split path from query on the first '?'.
+        var queryIndex = withoutFragment.IndexOf('?', StringComparison.Ordinal);
+        if (queryIndex < 0)
+        {
+            // No query string — return path as-is (fragment already dropped).
+            return withoutFragment;
+        }
+
+        var path = withoutFragment[..queryIndex];
+        var query = withoutFragment[queryIndex..]; // includes the leading '?'
+
+        var redactedQuery = RedactQuery(query);
+        return redactedQuery.Length == 0 ? path : $"{path}?{redactedQuery}";
+    }
+
+    // Redacts sensitive parameter values in a raw query string (with or without a leading '?').
+    // Returns the redacted query string without the leading '?', or an empty string if there are
+    // no key=value pairs after redaction.
+    private string RedactQuery(string query)
+    {
         var sb = new StringBuilder();
         foreach (var (key, value) in ParseQueryParams(query))
         {
@@ -95,7 +164,7 @@ public sealed class UrlRedactor
             sb.Append(Uri.EscapeDataString(redactedValue));
         }
 
-        return sb.Length == 0 ? baseUrl : $"{baseUrl}?{sb}";
+        return sb.ToString();
     }
 
     private static IEnumerable<(string Key, string Value)> ParseQueryParams(string query)
@@ -104,6 +173,9 @@ public sealed class UrlRedactor
         foreach (var part in raw.Split('&'))
         {
             var eq = part.IndexOf('=', StringComparison.Ordinal);
+
+            // Valueless params (e.g. "?flag") are intentionally skipped — a bare key
+            // carries no value that could leak a secret.
             if (eq < 0)
             {
                 continue;
