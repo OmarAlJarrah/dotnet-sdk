@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 using System.Buffers;
+using Dexpace.Sdk.Core.Errors;
 using Dexpace.Sdk.Core.Http.Common;
 using Xunit;
 
@@ -42,5 +43,23 @@ public sealed class SystemTextJsonSerdeTests
         var result = serde.Deserialize<Widget>(buffer.WrittenSpan);
 
         Assert.Equal(widget, result);
+    }
+
+    private sealed record Unregistered(string Value);
+
+    [Fact]
+    public void Deserialize_unknown_type_throws_DeserializationException()
+    {
+        var serde = Serde();
+        var ex = Assert.Throws<DeserializationException>(
+            () => serde.Deserialize<Unregistered>("{}"u8));
+        Assert.Contains("Unregistered", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Deserialize_malformed_json_throws_DeserializationException()
+    {
+        var serde = Serde();
+        Assert.Throws<DeserializationException>(() => serde.Deserialize<Widget>("{ not json"u8));
     }
 }

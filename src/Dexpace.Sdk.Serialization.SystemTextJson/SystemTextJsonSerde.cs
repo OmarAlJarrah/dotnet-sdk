@@ -56,7 +56,14 @@ public sealed class SystemTextJsonSerde : ISerde
     {
         ArgumentNullException.ThrowIfNull(destination);
         var info = GetTypeInfo<T>(forSerialize: true);
-        await JsonSerializer.SerializeAsync(destination, value, info, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await JsonSerializer.SerializeAsync(destination, value, info, cancellationToken).ConfigureAwait(false);
+        }
+        catch (JsonException ex)
+        {
+            throw new SerializationException($"Failed to serialize '{typeof(T)}' to JSON.", ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -64,7 +71,14 @@ public sealed class SystemTextJsonSerde : ISerde
     {
         ArgumentNullException.ThrowIfNull(source);
         var info = GetTypeInfo<T>(forSerialize: false);
-        return await JsonSerializer.DeserializeAsync(source, info, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await JsonSerializer.DeserializeAsync(source, info, cancellationToken).ConfigureAwait(false);
+        }
+        catch (JsonException ex)
+        {
+            throw new DeserializationException($"Failed to deserialize JSON to '{typeof(T)}'.", ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -73,21 +87,43 @@ public sealed class SystemTextJsonSerde : ISerde
         ArgumentNullException.ThrowIfNull(destination);
         var info = GetTypeInfo<T>(forSerialize: true);
         using var writer = new Utf8JsonWriter(destination);
-        JsonSerializer.Serialize(writer, value, info);
+        try
+        {
+            JsonSerializer.Serialize(writer, value, info);
+        }
+        catch (JsonException ex)
+        {
+            throw new SerializationException($"Failed to serialize '{typeof(T)}' to JSON.", ex);
+        }
     }
 
     /// <inheritdoc/>
     public T? Deserialize<T>(ReadOnlySpan<byte> utf8)
     {
         var info = GetTypeInfo<T>(forSerialize: false);
-        return JsonSerializer.Deserialize(utf8, info);
+        try
+        {
+            return JsonSerializer.Deserialize(utf8, info);
+        }
+        catch (JsonException ex)
+        {
+            throw new DeserializationException($"Failed to deserialize JSON to '{typeof(T)}'.", ex);
+        }
     }
 
     private JsonTypeInfo<T> GetTypeInfo<T>(bool forSerialize)
     {
-        if (_options.GetTypeInfo(typeof(T)) is JsonTypeInfo<T> info)
+        try
         {
-            return info;
+            if (_options.GetTypeInfo(typeof(T)) is JsonTypeInfo<T> info)
+            {
+                return info;
+            }
+        }
+        catch (NotSupportedException)
+        {
+            // Source-generated contexts throw NotSupportedException for unregistered types
+            // instead of returning null; map to the SDK exception type below.
         }
 
         return forSerialize
