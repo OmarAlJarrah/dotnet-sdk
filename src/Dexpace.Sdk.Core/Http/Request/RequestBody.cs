@@ -1,9 +1,11 @@
 // Copyright (c) 2026 dexpace and Omar Aljarrah.
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+using System.Buffers;
 using System.Text;
 using Dexpace.Sdk.Core.Errors;
 using Dexpace.Sdk.Core.Http.Common;
+using Dexpace.Sdk.Core.Serialization;
 
 namespace Dexpace.Sdk.Core.Http.Request;
 
@@ -84,6 +86,22 @@ public abstract class RequestBody
             "plain",
             new Dictionary<string, string> { ["charset"] = enc.WebName });
         return new BytesRequestBody(enc.GetBytes(text), type);
+    }
+
+    /// <summary>
+    /// Creates a replayable body by serializing <paramref name="value"/> with <paramref name="serde"/>.
+    /// </summary>
+    /// <typeparam name="T">The value type.</typeparam>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="serde">The serializer.</param>
+    /// <param name="contentType">The media type, or <see langword="null"/> for the serde's default.</param>
+    /// <returns>A replayable <see cref="RequestBody"/>.</returns>
+    public static RequestBody FromValue<T>(T value, ISerde serde, MediaType? contentType = null)
+    {
+        ArgumentNullException.ThrowIfNull(serde);
+        var buffer = new ArrayBufferWriter<byte>();
+        serde.Serialize(buffer, value);
+        return FromBytes(buffer.WrittenMemory, contentType ?? serde.DefaultMediaType);
     }
 
     /// <summary>
