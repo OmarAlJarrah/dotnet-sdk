@@ -18,7 +18,7 @@ namespace Dexpace.Sdk.Core.Auth;
 /// </list>
 /// </para>
 /// <para>
-/// Once either condition fails, a single goroutine acquires the per-key semaphore and calls
+/// Once either condition fails, a single caller acquires the per-key semaphore and calls
 /// the credential. All concurrent callers wait on the semaphore and perform a double-checked
 /// read after acquiring it. Only one network round-trip fires per key per refresh cycle.
 /// </para>
@@ -71,10 +71,13 @@ public sealed class AccessTokenCache
         var entry = _entries.GetOrAdd(context.CacheKey, static _ => new CacheEntry());
         var now = _time.GetUtcNow();
 
-        // Fast path: cached and no refresh needed — return without acquiring the semaphore.
-        if (entry.Token is { } cached && IsValid(cached, now) && !NeedsRefresh(cached, now))
+        // Fast path: read the holder once (volatile acquire) and return immediately when the
+        // token is still valid and does not need a proactive refresh. The volatile read ensures
+        // that any holder published by a slow-path writer is fully visible to this thread.
+        var fastHolder = entry.Holder;
+        if (fastHolder is not null && IsValid(fastHolder.Token, now) && !NeedsRefresh(fastHolder.Token, now))
         {
-            return cached;
+            return fastHolder.Token;
         }
 
         // Slow path: acquire the semaphore for this key.
@@ -83,24 +86,30 @@ public sealed class AccessTokenCache
         {
             // Double-check after acquiring.
             now = _time.GetUtcNow();
-            if (entry.Token is { } rechecked && IsValid(rechecked, now) && !NeedsRefresh(rechecked, now))
+            var recheckedHolder = entry.Holder;
+            if (recheckedHolder is not null && IsValid(recheckedHolder.Token, now) && !NeedsRefresh(recheckedHolder.Token, now))
             {
-                return rechecked;
+                return recheckedHolder.Token;
             }
 
             // Try to refresh from the credential.
             try
             {
                 var fresh = await _credential.GetTokenAsync(context, ct).ConfigureAwait(false);
-                entry.Token = fresh;
+                // Volatile write releases the fully-constructed holder to all threads.
+                entry.Holder = new TokenHolder(fresh);
                 return fresh;
             }
             catch
             {
-                // If we still have a valid (not-yet-expired) token, swallow the failure.
-                if (entry.Token is { } fallback && IsValid(fallback, now))
+                // Re-sample time: GetTokenAsync may have taken a long time. Validate the
+                // cached token against the clock *after* the (slow) failing call, so a token
+                // that expired during the attempt is not returned as valid.
+                var nowAfterFailure = _time.GetUtcNow();
+                var fallbackHolder = entry.Holder;
+                if (fallbackHolder is not null && IsValid(fallbackHolder.Token, nowAfterFailure))
                 {
-                    return fallback;
+                    return fallbackHolder.Token;
                 }
 
                 throw;
@@ -120,10 +129,40 @@ public sealed class AccessTokenCache
     private static bool NeedsRefresh(AccessToken token, DateTimeOffset now) =>
         token.RefreshOn is { } refreshOn && now >= refreshOn;
 
+    // Immutable wrapper so the token can be published through a single volatile reference,
+    // giving acquire/release ordering on all platforms. AccessToken is a multi-field struct;
+    // publishing it directly would allow fast-path readers to observe a torn or partially
+    // written value. Boxing it inside a reference type (TokenHolder) reduces the published
+    // value to a single pointer-width write, which the .NET memory model guarantees to be
+    // atomic and not torn.
+    private sealed class TokenHolder
+    {
+        /// <summary>Initializes a <see cref="TokenHolder"/> wrapping the given token.</summary>
+        /// <param name="token">The token to publish atomically.</param>
+        public TokenHolder(AccessToken token) => Token = token;
+
+        /// <summary>The wrapped access token.</summary>
+        public AccessToken Token { get; }
+    }
+
     private sealed class CacheEntry
     {
-        /// <summary>The most recently fetched token, or <see langword="null"/> if none.</summary>
-        public AccessToken? Token { get; set; }
+        // volatile ensures that a fast-path reader always observes the most recently published
+        // holder (acquire semantics on read, release semantics on write). Combined with the
+        // pointer-width atomicity of reference reads/writes, this is safe without a lock on
+        // the fast path.
+        private volatile TokenHolder? _holder;
+
+        /// <summary>
+        /// The most recently published token holder, or <see langword="null"/> if no token
+        /// has been fetched yet. Reads and writes are reference-atomic and carry
+        /// acquire/release ordering via the <see langword="volatile"/> modifier.
+        /// </summary>
+        public TokenHolder? Holder
+        {
+            get => _holder;
+            set => _holder = value;
+        }
 
         /// <summary>
         /// A semaphore (initial count = 1) that serializes refresh calls for this key.
