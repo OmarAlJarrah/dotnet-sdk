@@ -66,9 +66,11 @@ public sealed class PipelineContext
     public DexpaceClientOptions Options { get; }
 
     /// <summary>
-    /// A token that can cancel the in-flight operation.
+    /// A token that can cancel the in-flight operation. The operation policy may replace this
+    /// with a timeout-linked token before forwarding the call so the overall deadline is
+    /// enforced throughout the chain.
     /// </summary>
-    public CancellationToken CancellationToken { get; }
+    public CancellationToken CancellationToken { get; internal set; }
 
     /// <summary>
     /// The zero-based retry attempt counter. <c>0</c> on the initial send;
