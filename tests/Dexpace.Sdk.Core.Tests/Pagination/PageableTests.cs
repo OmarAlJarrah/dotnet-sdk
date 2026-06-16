@@ -497,4 +497,145 @@ public class PageableTests
                 p => p.Items,
                 null!));
     }
+
+    // ── disposal: early break ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task EarlyBreak_FirstBodyDisposed_AndTransportCalledOnce()
+    {
+        var body1 = new TrackingBody();
+        var page1 = new TestPage([1, 2], HasNext: true);
+        var page2 = new TestPage([3, 4], HasNext: false);
+
+        var serde = new ScriptedSerde<TestPage>(page1, page2);
+        var (pipeline, transport) = MakePipeline(
+            new Response(Status.Ok, body: body1),
+            new Response(Status.Ok));
+
+        var pageable = MakePageable(pipeline, serde);
+
+        // Consume only the first item then break — second page must never be fetched.
+        await foreach (var _ in pageable)
+        {
+            break;
+        }
+
+        Assert.True(body1.Disposed, "First response body should be disposed after early break.");
+        Assert.Equal(1, transport.CallCount);
+    }
+
+    // ── disposal: exception path ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ExceptionFromSerde_BodyStillDisposed()
+    {
+        var body = new TrackingBody();
+
+        // Serde throws on the first call.
+        var throwingSerde = new ThrowingOnFirstCallSerde();
+        var (pipeline, _) = MakePipeline(new Response(Status.Ok, body: body));
+
+        var pageable = Pageable.Create<TestPage, int>(
+            pipeline,
+            Request.Get("https://api.example.com/items"),
+            throwingSerde,
+            DefaultOptions,
+            p => p.Items,
+            NextRequest);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in pageable) { }
+        });
+
+        Assert.True(body.Disposed, "Response body must be disposed even when the serde throws.");
+    }
+
+    // ── re-enumeration ────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ReEnumeration_EachEnumerationRestartsFromFirst()
+    {
+        // Two passes, each should see the same items and drive the transport independently.
+        var p1 = new TestPage([10, 20], HasNext: false);
+        var p2 = new TestPage([10, 20], HasNext: false); // scripted twice
+
+        var serde = new ScriptedSerde<TestPage>(p1, p2);
+        var (pipeline, transport) = MakePipeline(
+            new Response(Status.Ok),
+            new Response(Status.Ok));
+
+        var pageable = MakePageable(pipeline, serde);
+
+        var first = new List<int>();
+        await foreach (var item in pageable) { first.Add(item); }
+
+        var second = new List<int>();
+        await foreach (var item in pageable) { second.Add(item); }
+
+        Assert.Equal([10, 20], first);
+        Assert.Equal([10, 20], second);
+        // Each enumeration should have caused exactly one HTTP call (2 total).
+        Assert.Equal(2, transport.CallCount);
+    }
+
+    // ── cancellation ──────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Cancellation_AlreadyCancelled_Items_ThrowsBeforeTransport()
+    {
+        var (pipeline, transport) = MakePipeline(new Response(Status.Ok));
+        var serde = new ScriptedSerde<TestPage>(new TestPage([1], HasNext: false));
+        var pageable = MakePageable(pipeline, serde);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var _ in pageable.WithCancellation(cts.Token)) { }
+        });
+
+        Assert.Equal(0, transport.CallCount);
+    }
+
+    [Fact]
+    public async Task Cancellation_AlreadyCancelled_Pages_ThrowsBeforeTransport()
+    {
+        var (pipeline, transport) = MakePipeline(new Response(Status.Ok));
+        var serde = new ScriptedSerde<TestPage>(new TestPage([1], HasNext: false));
+        var pageable = MakePageable(pipeline, serde);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var _ in pageable.AsPages().WithCancellation(cts.Token)) { }
+        });
+
+        Assert.Equal(0, transport.CallCount);
+    }
+
+    // ── helpers for the new tests ─────────────────────────────────────────────────────────────
+
+    // ISerde that always throws InvalidOperationException from DeserializeAsync.
+    private sealed class ThrowingOnFirstCallSerde : ISerde
+    {
+        public MediaType DefaultMediaType => MediaType.Of("application", "json");
+
+        public ValueTask SerializeAsync<TVal>(Stream destination, TVal value, CancellationToken ct = default) =>
+            ValueTask.CompletedTask;
+
+        public async ValueTask<TVal?> DeserializeAsync<TVal>(Stream source, CancellationToken ct = default)
+        {
+            // Drain the body before throwing so disposal tracking stays clean.
+            await source.CopyToAsync(Stream.Null, ct).ConfigureAwait(false);
+            throw new InvalidOperationException("Serde failure injected by test.");
+        }
+
+        public void Serialize<TVal>(System.Buffers.IBufferWriter<byte> destination, TVal value) { }
+
+        public TVal? Deserialize<TVal>(ReadOnlySpan<byte> utf8) => default;
+    }
 }

@@ -71,6 +71,10 @@ public static class Pageable
         int? maxPages) : AsyncPageable<T>
     {
         /// <inheritdoc/>
+        /// <remarks>
+        /// <paramref name="pageSizeHint"/> is not plumbed into the outgoing request in v1; cancel
+        /// the pages path via <c>.WithCancellation(token)</c> on the returned sequence.
+        /// </remarks>
         public override IAsyncEnumerable<Page<T>> AsPages(int? pageSizeHint = null) =>
             PagesCore(CancellationToken.None);
 
@@ -87,6 +91,8 @@ public static class Pageable
 
             while (true)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 if (maxPages.HasValue && fetched >= maxPages.Value)
                 {
                     yield break;
