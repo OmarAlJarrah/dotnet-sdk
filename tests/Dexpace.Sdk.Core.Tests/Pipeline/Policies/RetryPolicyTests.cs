@@ -420,20 +420,80 @@ public sealed class RetryPolicyTests
     // -------------------------------------------------------------------------
 
     [Fact]
-    public async Task ProcessAsync_DelayPerAttempt_IsNonNegativeAndNeverExceedsMaxDelay()
+    public async Task ProcessAsync_OverflowGuard_AllRecordedDelaysAreNonNegativeAndBoundedByMaxDelay()
     {
-        // Three consecutive retryable responses → three delays recorded.
-        // Each must be in [0, MaxDelay].
-        var baseDelay = TimeSpan.FromMilliseconds(5);
-        var maxDelay = TimeSpan.FromMilliseconds(50);
+        // Choose BaseDelay and MaxRetryAttempts such that the OLD formula
+        //   BaseDelay.Ticks * (1L << shift)
+        // would overflow long and wrap negative on at least one attempt.
+        //
+        // TimeSpan.FromDays(700).Ticks ≈ 6.05e17.  At shift = 4 (attempt 4):
+        //   6.05e17 << 4 = ~9.7e18, which is > long.MaxValue (9.22e18) → wraps negative.
+        // With MaxRetryAttempts = 5 we get shifts 0..4, covering the overflow at shift 4.
+        //
+        // The overflow-safe implementation clamps to MaxDelay instead of overflowing,
+        // so every recorded delay must be non-negative and <= MaxDelay.
+        // Against the old code, at least one attempt would compute a negative cap,
+        // causing the jitter draw to be zero and skipping Task.Delay entirely — which
+        // would mean a delay of TimeSpan.Zero being recorded by RecordingTimeProvider
+        // after a shift that should have been clamped to MaxDelay.  The assertion that
+        // ALL recorded delays are > TimeSpan.Zero would catch that (jitter from
+        // cap = 0 → delay = 0 → not recorded, but the assertion on Count would fail
+        // because a skipped delay leaves fewer entries).  We therefore assert both:
+        //   (a) the count equals MaxRetryAttempts, and
+        //   (b) every entry is in [0, MaxDelay].
+        var baseDelay = TimeSpan.FromDays(700);   // ~6e17 ticks; shift≥4 overflows old code
+        var maxDelay = TimeSpan.FromSeconds(30);  // small cap — meaningful upper bound
 
-        var transport = new ScriptedTransport(
-        [
-            new Response(Status.ServiceUnavailable),
-            new Response(Status.ServiceUnavailable),
-            new Response(Status.ServiceUnavailable),
-            new Response(Status.Ok),
-        ]);
+        // 1 initial + 5 retries = 6 transport calls.
+        var responses = Enumerable
+            .Repeat<object>(new Response(Status.ServiceUnavailable), 5)
+            .Append(new Response(Status.Ok))
+            .ToArray();
+        var recording = new RecordingTimeProvider();
+
+        var options = new DexpaceClientOptions
+        {
+            Retry = new RetryOptions
+            {
+                MaxRetryAttempts = 5,
+                BaseDelay = baseDelay,
+                MaxDelay = maxDelay,
+                HonorRetryAfter = false,
+            }
+        };
+
+        var pipeline = new PipelineBuilder().Add(new RetryPolicy(recording)).Build(transport: new ScriptedTransport(responses));
+        await pipeline.SendAsync(MakeGetRequest(), options);
+
+        // Five retries → five delays recorded (one per retry, not per attempt).
+        Assert.Equal(5, recording.RequestedDelays.Count);
+        Assert.All(recording.RequestedDelays, pair =>
+        {
+            Assert.True(pair.Item2 >= TimeSpan.Zero,
+                $"Delay at timer call {pair.Item1} was negative: {pair.Item2}");
+            Assert.True(pair.Item2 <= maxDelay,
+                $"Delay at timer call {pair.Item1} exceeded MaxDelay ({maxDelay}): {pair.Item2}");
+        });
+    }
+
+    [Fact]
+    public async Task ProcessAsync_DelayBound_LaterAttemptsArePinnedToMaxDelay()
+    {
+        // Choose BaseDelay == MaxDelay so that even attempt 0 (shift = 0) computes
+        //   cap = min(BaseDelay * 1, MaxDelay) = MaxDelay.
+        // This means the jitter-cap is MaxDelay for EVERY attempt, and the assertion
+        //   delay <= MaxDelay
+        // is meaningful — it is governed by the cap logic, not by BaseDelay being small.
+        // Against a naive implementation that forgets to apply the cap, some draws
+        // (from a cap larger than MaxDelay) could land above MaxDelay.
+        var maxDelay = TimeSpan.FromSeconds(30);
+        var baseDelay = maxDelay; // BaseDelay == MaxDelay → cap == MaxDelay for all attempts
+
+        // 1 initial + 3 retries = 4 transport calls.
+        var responses = Enumerable
+            .Repeat<object>(new Response(Status.ServiceUnavailable), 3)
+            .Append(new Response(Status.Ok))
+            .ToArray();
         var recording = new RecordingTimeProvider();
 
         var options = new DexpaceClientOptions
@@ -447,54 +507,17 @@ public sealed class RetryPolicyTests
             }
         };
 
-        var pipeline = new PipelineBuilder().Add(new RetryPolicy(recording)).Build(transport);
+        var pipeline = new PipelineBuilder().Add(new RetryPolicy(recording)).Build(transport: new ScriptedTransport(responses));
         await pipeline.SendAsync(MakeGetRequest(), options);
 
         // Three retries → three delays recorded.
         Assert.Equal(3, recording.RequestedDelays.Count);
-        foreach (var (attemptIndex, delay) in recording.RequestedDelays)
-        {
-            Assert.True(delay >= TimeSpan.Zero, $"Delay at timer call {attemptIndex} was negative: {delay}");
-            Assert.True(delay <= maxDelay, $"Delay at timer call {attemptIndex} exceeded MaxDelay ({maxDelay}): {delay}");
-        }
-    }
-
-    [Fact]
-    public async Task ProcessAsync_VeryLargeBaseDelay_NeverOverflows_DelayClampedAtMaxDelay()
-    {
-        // BaseDelay large enough that naive multiplication overflows a long for attempt >= 1.
-        // MaxDelay is the same; the overflow-safe cap must clamp cleanly.
-        var baseDelay = TimeSpan.FromHours(1);  // 36_000_000_000_0 ticks — shift by 1 → overflow
-        var maxDelay = TimeSpan.FromSeconds(30);
-
-        var transport = new ScriptedTransport(
-        [
-            new Response(Status.ServiceUnavailable),
-            new Response(Status.ServiceUnavailable),
-            new Response(Status.Ok),
-        ]);
-        var recording = new RecordingTimeProvider();
-
-        var options = new DexpaceClientOptions
-        {
-            Retry = new RetryOptions
-            {
-                MaxRetryAttempts = 2,
-                BaseDelay = baseDelay,
-                MaxDelay = maxDelay,
-                HonorRetryAfter = false,
-            }
-        };
-
-        var pipeline = new PipelineBuilder().Add(new RetryPolicy(recording)).Build(transport);
-        await pipeline.SendAsync(MakeGetRequest(), options);
-
-        // Every recorded delay must be non-negative and at most MaxDelay.
-        Assert.Equal(2, recording.RequestedDelays.Count);
         Assert.All(recording.RequestedDelays, pair =>
         {
-            Assert.True(pair.Item2 >= TimeSpan.Zero, $"Delay was negative: {pair.Item2}");
-            Assert.True(pair.Item2 <= maxDelay, $"Delay exceeded MaxDelay ({maxDelay}): {pair.Item2}");
+            Assert.True(pair.Item2 >= TimeSpan.Zero,
+                $"Delay at timer call {pair.Item1} was negative: {pair.Item2}");
+            Assert.True(pair.Item2 <= maxDelay,
+                $"Delay at timer call {pair.Item1} exceeded MaxDelay ({maxDelay}): {pair.Item2}");
         });
     }
 
